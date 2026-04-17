@@ -1,0 +1,21 @@
+cat > .gitignore << 'EOF'
+# macOS
+.DS_Store
+
+# R
+.Rhistory
+.RData
+.Rproj.user/
+
+# Quarto rendered output
+*.html
+!clinical_trial_adam.html
+!index.html
+clinical_trial_adam_files/
+
+# Data — never commit
+data/
+*.xpt
+*.sas7bdat
+*.csv
+EOF
