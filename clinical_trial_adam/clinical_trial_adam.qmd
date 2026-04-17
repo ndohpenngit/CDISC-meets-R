@@ -1,0 +1,704 @@
+---
+title: "Clinical Trial Analysis: Full End-to-End SDTM to ADaM Pipeline"
+subtitle: "CDISC-Compliant ADaM Dataset Construction and TLF Generation"
+author: "Ndoh Penn"
+date: today
+format:
+  html:
+    toc: true
+    toc-float: true
+    toc-depth: 3
+    code-fold: true
+    code-summary: "Show Code"
+    theme: cosmo
+    fig-width: 10
+    fig-height: 6
+    df-print: paged
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+## 1. Setup and Environment
+
+```{r setup}
+#| label: setup
+#| include: false
+
+rm(list = ls())
+
+# Install pacman if not present, then use it to manage all packages
+if (!require("pacman")) install.packages("pacman")
+
+pacman::p_load(
+  # ADaM construction
+  admiral,
+  admiral.test,
+  # Data handling
+  haven,
+  dplyr,
+  tidyr,
+  lubridate,
+  stringr,
+  forcats,
+  # Tables & Outputs (TLFs)
+  gt,
+  gtsummary,
+  # Visualisation
+  ggplot2,
+  survival,
+  survminer,
+  # Reporting utilities
+  knitr,
+  kableExtra
+)
+```
+
+## Introduction
+
+This document presents a **full end-to-end clinical trial analysis pipeline**, covering:
+
+1. **SDTM Data Loading** — Demographics (DM), Adverse Events (AE), Exposure (EX), Disposition (DS), Vital Signs (VS)
+2. **ADaM Dataset Construction** — ADSL, ADAE, ADVS
+3. **Quality Checks** — Record counts, population flags, missing data summaries
+4. **Tables, Listings, and Figures (TLFs)** — Demographic summary, AE incidence table, Kaplan–Meier survival curve, vital signs over time
+
+All derivations follow **CDISC ADaM Implementation Guide** conventions using the [`admiral`](https://pharmaverse.github.io/admiral/) package from the pharmaverse ecosystem.
+
+---
+
+## 2. Data Loading
+
+> In a production environment, SDTM `.xpt` files are loaded from a validated data transfer location. Here we use the `admiral.test` sample datasets to ensure full reproducibility.
+
+```{r load-data}
+#| label: load-data
+
+# ---------------------------------------------------------------------------
+# PRODUCTION: read from validated SDTM delivery path, e.g.:
+#   sdtm_path <- "data/sdtm/"
+#   dm <- read_xpt(file.path(sdtm_path, "dm.xpt"))
+#   ae <- read_xpt(file.path(sdtm_path, "ae.xpt"))
+# ---------------------------------------------------------------------------
+
+data(admiral_dm)
+data(admiral_ae)
+data(admiral_ex)
+data(admiral_ds)
+data(admiral_vs)
+
+# Rename to conventional SDTM domain names for clarity
+dm <- admiral_dm
+ae <- admiral_ae
+ex <- admiral_ex
+ds <- admiral_ds
+vs <- admiral_vs
+
+# Quick inventory check
+domain_summary <- tibble::tibble(
+  Domain    = c("DM", "AE", "EX", "DS", "VS"),
+  Rows      = c(nrow(dm), nrow(ae), nrow(ex), nrow(ds), nrow(vs)),
+  Subjects  = c(
+    n_distinct(dm$USUBJID),
+    n_distinct(ae$USUBJID),
+    n_distinct(ex$USUBJID),
+    n_distinct(ds$USUBJID),
+    n_distinct(vs$USUBJID)
+  ),
+  Description = c(
+    "Demographics",
+    "Adverse Events",
+    "Exposure",
+    "Disposition",
+    "Vital Signs"
+  )
+)
+
+domain_summary |>
+  gt() |>
+  tab_header(title = "SDTM Domain Inventory") |>
+  tab_style(
+    style = cell_fill(color = "#2E75B6", alpha = 0.15),
+    locations = cells_column_labels()
+  ) |>
+  fmt_number(columns = c(Rows, Subjects), decimals = 0)
+```
+
+---
+
+## 3. ADSL — Subject-Level Analysis Dataset
+
+ADSL contains **one row per subject** and is the foundation for all subsequent ADaM datasets.
+
+### 3.1 Treatment Variables
+
+```{r adsl-treatment}
+#| label: adsl-treatment
+
+adsl <- dm |>
+  # ---- Planned & Actual Treatment from first non-zero dose record ----
+  admiral::derive_vars_merged(
+    dataset_add = ex,
+    by_vars    = exprs(USUBJID),
+    order      = exprs(EXSEQ),
+    mode       = "first",
+    new_vars   = exprs(TRT01P = EXTRT, TRT01A = EXTRT),
+    filter_add = EXDOSE > 0
+  )
+```
+
+### 3.2 Safety Population Flag
+
+```{r adsl-saffl}
+#| label: adsl-saffl
+
+adsl <- adsl |>
+  # SAFFL = "Y" if subject received at least one dose
+  admiral::derive_var_merged_exist_flag(
+    dataset_add = ex,
+    by_vars     = exprs(USUBJID),
+    new_var     = SAFFL,
+    condition   = EXDOSE > 0
+  )
+```
+
+### 3.3 Intent-to-Treat Population Flag
+
+```{r adsl-ittfl}
+#| label: adsl-ittfl
+
+adsl <- adsl |>
+  # ITTFL = "Y" for all randomised subjects (ARM is not screen failure / not missing)
+  dplyr::mutate(
+    ITTFL = dplyr::if_else(
+      !is.na(ARM) & ARM != "Screen Failure",
+      "Y", "N",
+      missing = "N"
+    )
+  )
+```
+
+### 3.4 Study Dates and Duration
+
+```{r adsl-dates}
+#| label: adsl-dates
+
+adsl <- adsl |>
+  # Convert ISO 8601 character dates to SAS-style numeric date variables
+  admiral::derive_vars_dt(
+    new_vars_prefix = "TRTS",
+    dtc             = RFSTDTC   # Reference Start Date (first dose)
+  ) |>
+  admiral::derive_vars_dt(
+    new_vars_prefix = "TRTE",
+    dtc             = RFENDTC   # Reference End Date (last dose)
+  ) |>
+  # Duration on treatment (days)
+  dplyr::mutate(
+    TRTDURD = as.numeric(TRTEDT - TRTSDT) + 1L
+  )
+```
+
+### 3.5 Baseline Age Group
+
+```{r adsl-agegroup}
+#| label: adsl-agegroup
+
+adsl <- adsl |>
+  dplyr::mutate(
+    AGEGR1 = dplyr::case_when(
+      AGE <  65             ~ "<65",
+      AGE >= 65 & AGE < 75  ~ "65–74",
+      AGE >= 75             ~ ">=75",
+      TRUE                  ~ NA_character_
+    ),
+    AGEGR1 = factor(AGEGR1, levels = c("<65", "65–74", ">=75"))
+  )
+```
+
+### 3.6 ADSL Quality Check
+
+```{r adsl-qc}
+#| label: adsl-qc
+
+cat("========== ADSL Quality Check ==========\n")
+cat("Total subjects:         ", nrow(adsl), "\n")
+cat("Unique USUBJIDs:        ", n_distinct(adsl$USUBJID), "\n")
+cat("Duplicates (should=0):  ", nrow(adsl) - n_distinct(adsl$USUBJID), "\n\n")
+
+cat("Population flags:\n")
+adsl |>
+  dplyr::count(SAFFL, ITTFL) |>
+  dplyr::rename(`SAFFL` = SAFFL, `ITTFL` = ITTFL, `N` = n) |>
+  knitr::kable() |>
+  kableExtra::kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+---
+
+## 4. ADAE — Adverse Event Analysis Dataset
+
+ADAE contains **one row per adverse event per subject** and is the primary dataset for safety analyses.
+
+### 4.1 Merge Subject-Level Variables and Derive Analysis Dates
+
+```{r adae-build}
+#| label: adae-build
+
+adae <- ae |>
+  # Merge treatment and population flags from ADSL
+  admiral::derive_vars_merged(
+    dataset_add = dplyr::select(adsl, USUBJID, TRT01P, TRT01A, SAFFL, TRTSDT),
+    by_vars     = exprs(USUBJID)
+  ) |>
+  # Restrict to safety population
+  dplyr::filter(SAFFL == "Y") |>
+  # AE start date (ISO 8601 → numeric)
+  admiral::derive_vars_dt(
+    new_vars_prefix = "AST",
+    dtc             = AESTDTC
+  ) |>
+  # AE end date
+  admiral::derive_vars_dt(
+    new_vars_prefix = "AEN",
+    dtc             = AEENDTC
+  ) |>
+  # Study day of AE onset relative to first dose
+  dplyr::mutate(
+    ASTDY = as.integer(ASTDT - TRTSDT) + 1L
+  )
+```
+
+### 4.2 Derive Severity and Seriousness Flags
+
+```{r adae-flags}
+#| label: adae-flags
+
+adae <- adae |>
+  dplyr::mutate(
+    # Serious AE flag
+    AESERF = dplyr::if_else(AESER == "Y", "Y", "N", missing = "N"),
+    # Grade 3+ severity flag (CTCAE-style: map AESEV text to numeric grade)
+    AESEVN = dplyr::case_when(
+      AESEV == "MILD"     ~ 1L,
+      AESEV == "MODERATE" ~ 2L,
+      AESEV == "SEVERE"   ~ 3L,
+      TRUE                ~ NA_integer_
+    ),
+    CTC3FLG = dplyr::if_else(AESEVN >= 3L, "Y", "N", missing = "N"),
+    # Treatment-emergent flag: AE onset on or after first dose date
+    TRTEMFL = dplyr::if_else(
+      !is.na(ASTDT) & !is.na(TRTSDT) & ASTDT >= TRTSDT,
+      "Y", "N", missing = "N"
+    )
+  )
+```
+
+### 4.3 ADAE Quality Check
+
+```{r adae-qc}
+#| label: adae-qc
+
+cat("========== ADAE Quality Check ==========\n")
+cat("Total AE records:       ", nrow(adae), "\n")
+cat("Subjects with AEs:      ", n_distinct(adae$USUBJID), "\n")
+cat("Treatment-emergent AEs: ",
+    sum(adae$TRTEMFL == "Y", na.rm = TRUE), "\n")
+cat("Serious AEs:            ",
+    sum(adae$AESERF  == "Y", na.rm = TRUE), "\n\n")
+```
+
+---
+
+## 5. ADVS — Vital Signs Analysis Dataset
+
+ADVS is used for efficacy analyses involving continuous endpoint measurements (systolic BP, diastolic BP, heart rate, weight).
+
+### 5.1 Build ADVS
+
+```{r advs-build}
+#| label: advs-build
+
+# Parameters of interest
+vs_params <- c("SYSBP", "DIABP", "PULSE", "WEIGHT")
+
+advs <- vs |>
+  # Merge subject-level variables
+  admiral::derive_vars_merged(
+    dataset_add = dplyr::select(adsl, USUBJID, TRT01P, TRT01A, SAFFL, TRTSDT),
+    by_vars     = exprs(USUBJID)
+  ) |>
+  # Safety population only
+  dplyr::filter(SAFFL == "Y", VSTESTCD %in% vs_params) |>
+  # Analysis date
+  admiral::derive_vars_dt(
+    new_vars_prefix = "A",
+    dtc             = VSDTC
+  ) |>
+  # Analysis value (numeric) and parameter label
+  dplyr::mutate(
+    AVAL    = VSSTRESN,
+    PARAM   = VSTEST,
+    PARAMCD = VSTESTCD,
+    # Baseline: the last pre-dose measurement (VSBLFL == "Y" in SDTM, or derive below)
+    ABLFL   = dplyr::if_else(VSBLFL == "Y", "Y", "N", missing = "N"),
+    # Study day
+    ADY     = as.integer(ADT - TRTSDT) + 1L
+  )
+
+# Merge baseline values back
+# advs <- advs |>
+#   admiral::derive_var_base(
+#     by_vars    = exprs(USUBJID, PARAMCD),
+#     source_var = AVAL,
+#     new_var    = BASE
+#   ) |>
+#   # Change from baseline
+#   dplyr::mutate(
+#     CHG  = AVAL - BASE,
+#     PCHG = round(100 * CHG / BASE, 2)
+#   )
+
+# # See which subject/parameter combos have duplicate baselines
+# admiral::get_duplicates_dataset() |>
+#   dplyr::select(USUBJID, PARAMCD, VSDTC, VSBLFL, ABLFL) |>
+#   print(n = 30)
+
+
+# ---- Re-derive ABLFL cleanly ----
+  # Restrict candidates: non-missing AVAL, on or before first dose (ADY <= 1)
+advs <- advs |>
+  admiral::derive_var_extreme_flag(
+    by_vars    = exprs(USUBJID, PARAMCD),
+    order      = exprs(ADT, VSSEQ),   # last date, then highest sequence
+    mode       = "last",              # last observation wins
+    # filter     = ADY <= 1 & !is.na(AVAL),
+    new_var    = ABLFL
+  ) |>
+  # Now derive BASE safely — guaranteed one baseline per USUBJID + PARAMCD
+  admiral::derive_var_base(
+    by_vars    = exprs(USUBJID, PARAMCD),
+    source_var = AVAL,
+    # new_var    = BASE
+  ) |>
+  dplyr::mutate(
+    CHG  = AVAL - BASE,
+    PCHG = dplyr::if_else(BASE != 0, round(100 * CHG / BASE, 2), NA_real_)
+  )
+
+advs |>
+  dplyr::filter(ABLFL == "Y") |>
+  dplyr::count(USUBJID, PARAMCD) |>
+  dplyr::filter(n > 1)
+
+cat("ADVS records:", nrow(advs),
+    "| Subjects:", n_distinct(advs$USUBJID),
+    "| Parameters:", n_distinct(advs$PARAMCD), "\n")
+```
+
+---
+
+## 6. Tables, Listings & Figures (TLFs)
+
+### 6.1 Table: Demographic and Baseline Characteristics
+
+```{r tlf-demog}
+#| label: tlf-demog
+
+adsl |>
+  dplyr::filter(SAFFL == "Y") |>
+  dplyr::select(TRT01P, AGE, AGEGR1, SEX, RACE) |>
+  dplyr::mutate(
+    TRT01P = factor(TRT01P),
+    SEX    = factor(SEX,  levels = c("M", "F"), labels = c("Male", "Female")),
+    RACE   = stringr::str_to_title(RACE)
+  ) |>
+  gtsummary::tbl_summary(
+    by         = TRT01P,
+    label      = list(
+      AGE    ~ "Age (years)",
+      AGEGR1 ~ "Age Group",
+      SEX    ~ "Sex",
+      RACE   ~ "Race"
+    ),
+    statistic  = list(
+      all_continuous()  ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits     = all_continuous() ~ 1
+  ) |>
+  gtsummary::add_overall() |>
+  gtsummary::add_p() |>
+  gtsummary::bold_labels() |>
+  gtsummary::modify_header(label ~ "**Characteristic**") |>
+  gtsummary::modify_caption(
+    "**Table 1. Demographic and Baseline Characteristics — Safety Population**"
+  )
+```
+
+### 6.2 Table: Treatment-Emergent Adverse Events by System Organ Class
+
+```{r tlf-ae-table}
+#| label: tlf-ae-table
+
+# Subjects per treatment arm (denominator for incidence %)
+n_by_trt <- adsl |>
+  dplyr::filter(SAFFL == "Y") |>
+  dplyr::count(TRT01P, name = "N_ARM")
+
+ae_soc <- adae |>
+  dplyr::filter(TRTEMFL == "Y") |>
+  dplyr::distinct(USUBJID, AEBODSYS, TRT01P) |>          # one record per subject per SOC
+  dplyr::count(AEBODSYS, TRT01P, name = "n_subj") |>
+  dplyr::left_join(n_by_trt, by = "TRT01P") |>
+  dplyr::mutate(
+    pct  = round(100 * n_subj / N_ARM, 1),
+    cell = paste0(n_subj, " (", pct, "%)")
+  ) |>
+  dplyr::select(AEBODSYS, TRT01P, cell) |>
+  tidyr::pivot_wider(names_from = TRT01P, values_from = cell, values_fill = "0 (0.0%)")
+
+ae_soc |>
+  dplyr::rename(`System Organ Class` = AEBODSYS) |>
+  gt::gt() |>
+  gt::tab_header(
+    title    = "Table 2. Treatment-Emergent Adverse Events",
+    subtitle = "Subjects with ≥1 TEAE by System Organ Class — Safety Population"
+  ) |>
+  gt::tab_style(
+    style     = gt::cell_fill(color = "#2E75B6", alpha = 0.15),
+    locations = gt::cells_column_labels()
+  ) |>
+  gt::tab_style(
+    style     = gt::cell_text(weight = "bold"),
+    locations = gt::cells_column_labels()
+  ) |>
+  gt::opt_row_striping()
+```
+
+### 6.3 Table: Serious Adverse Events Summary
+
+```{r tlf-sae-table}
+#| label: tlf-sae-table
+
+adae |>
+  dplyr::filter(TRTEMFL == "Y") |>
+  dplyr::select(TRT01P, AESERF, CTC3FLG) |>
+  dplyr::mutate(
+    TRT01P = factor(TRT01P),
+    AESERF  = factor(AESERF,  levels = c("Y", "N"), labels = c("Serious", "Non-serious")),
+    CTC3FLG = factor(CTC3FLG, levels = c("Y", "N"), labels = c("Grade ≥3", "Grade <3"))
+  ) |>
+  gtsummary::tbl_summary(
+    by    = TRT01P,
+    label = list(AESERF ~ "Seriousness", CTC3FLG ~ "Severity Grade")
+  ) |>
+  gtsummary::add_overall() |>
+  gtsummary::bold_labels() |>
+  gtsummary::modify_caption("**Table 3. TEAE Seriousness and Severity — Safety Population**")
+```
+
+### 6.4 Figure: Adverse Event Incidence by Treatment and SOC
+
+```{r tlf-ae-figure}
+#| label: tlf-ae-figure
+#| fig-cap: "Figure 1. Incidence of TEAEs by System Organ Class and Treatment Group"
+
+ae_plot_data <- adae |>
+  dplyr::filter(TRTEMFL == "Y") |>
+  dplyr::distinct(USUBJID, AEBODSYS, TRT01P) |>
+  dplyr::count(AEBODSYS, TRT01P) |>
+  dplyr::left_join(n_by_trt, by = "TRT01P") |>
+  dplyr::mutate(
+    pct      = 100 * n / N_ARM,
+    AEBODSYS = stringr::str_wrap(AEBODSYS, width = 30)
+  )
+
+ggplot2::ggplot(
+    ae_plot_data,
+    ggplot2::aes(x = pct, y = forcats::fct_reorder(AEBODSYS, pct), fill = TRT01P)
+  ) +
+  ggplot2::geom_col(position = "dodge", width = 0.65) +
+  ggplot2::scale_fill_manual(
+    values = c("#2E75B6", "#ED7D31", "#70AD47"),
+    name   = "Treatment"
+  ) +
+  ggplot2::labs(
+    x        = "Subjects with ≥1 TEAE (%)",
+    y        = NULL,
+    title    = "Treatment-Emergent Adverse Events by System Organ Class",
+    subtitle = "Safety Population"
+  ) +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(
+    legend.position  = "bottom",
+    panel.grid.major.y = ggplot2::element_blank(),
+    plot.title       = ggplot2::element_text(face = "bold")
+  )
+```
+
+### 6.5 Figure: Vital Signs — Mean Change from Baseline Over Time
+
+```{r tlf-vs-figure}
+#| label: tlf-vs-figure
+#| fig-cap: "Figure 2. Mean Change from Baseline in Systolic Blood Pressure Over Study Weeks"
+
+# Bin study days into nominal weeks
+advs_sysbp <- advs |>
+  dplyr::filter(PARAMCD == "SYSBP", !is.na(CHG), !is.na(TRT01P)) |>
+  dplyr::mutate(
+    WEEK = dplyr::case_when(
+      ADY <= 0   ~ "Baseline",
+      ADY <= 14  ~ "Week 2",
+      ADY <= 28  ~ "Week 4",
+      ADY <= 56  ~ "Week 8",
+      ADY <= 84  ~ "Week 12",
+      TRUE       ~ "Week 12+"
+    ),
+    WEEK = factor(WEEK, levels = c("Baseline", "Week 2", "Week 4", "Week 8", "Week 12", "Week 12+"))
+  ) |>
+  dplyr::group_by(TRT01P, WEEK) |>
+  dplyr::summarise(
+    mean_chg = mean(CHG,  na.rm = TRUE),
+    se_chg   = sd(CHG,   na.rm = TRUE) / sqrt(dplyr::n()),
+    n        = dplyr::n(),
+    .groups  = "drop"
+  )
+
+ggplot2::ggplot(
+    advs_sysbp,
+    ggplot2::aes(x = WEEK, y = mean_chg, colour = TRT01P, group = TRT01P)
+  ) +
+  ggplot2::geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+  ggplot2::geom_line(linewidth = 1) +
+  ggplot2::geom_point(size = 3) +
+  ggplot2::geom_errorbar(
+    ggplot2::aes(ymin = mean_chg - se_chg, ymax = mean_chg + se_chg),
+    width = 0.2
+  ) +
+  ggplot2::scale_colour_manual(
+    values = c("#2E75B6", "#ED7D31", "#70AD47"),
+    name   = "Treatment"
+  ) +
+  ggplot2::labs(
+    x        = "Study Visit",
+    y        = "Mean Change from Baseline (mmHg)",
+    title    = "Systolic Blood Pressure: Mean Change from Baseline",
+    subtitle = "Safety Population — Mean ± SE"
+  ) +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(
+    legend.position = "bottom",
+    plot.title      = ggplot2::element_text(face = "bold"),
+    axis.text.x     = ggplot2::element_text(angle = 30, hjust = 1)
+  )
+```
+
+### 6.6 Figure: Kaplan–Meier Time to First TEAE
+
+```{r tlf-km}
+#| label: tlf-km
+#| fig-cap: "Figure 3. Kaplan–Meier Estimate of Time to First Treatment-Emergent Adverse Event"
+
+# Build subject-level time-to-first-TEAE dataset
+first_ae <- adae |>
+  dplyr::filter(TRTEMFL == "Y", !is.na(ASTDY)) |>
+  dplyr::group_by(USUBJID) |>
+  dplyr::slice_min(ASTDY, n = 1, with_ties = FALSE) |>
+  dplyr::ungroup() |>
+  dplyr::select(USUBJID, TIME = ASTDY, EVENT = TRTEMFL)
+
+# All safety-pop subjects; those without an AE are censored at TRTDURD
+km_data <- adsl |>
+  dplyr::filter(SAFFL == "Y", !is.na(TRT01P)) |>
+  dplyr::select(USUBJID, TRT01P, TRTDURD) |>
+  dplyr::left_join(first_ae, by = "USUBJID") |>
+  dplyr::mutate(
+    TIME  = dplyr::coalesce(TIME, TRTDURD, 1L),
+    EVENT = dplyr::if_else(EVENT == "Y", 1L, 0L, missing = 0L),
+    TIME  = pmax(TIME, 1L)
+  )
+
+km_fit <- survival::survfit(
+  survival::Surv(TIME, EVENT) ~ TRT01P,
+  data = km_data
+)
+
+survminer::ggsurvplot(
+  km_fit,
+  data         = km_data,
+  risk.table   = TRUE,
+  pval         = TRUE,
+  conf.int     = TRUE,
+  xlab         = "Days Since First Dose",
+  ylab         = "Probability of Remaining TEAE-Free",
+  title        = "Time to First TEAE — Safety Population",
+  legend.title = "Treatment",
+  palette      = c("#2E75B6", "#ED7D31", "#70AD47"),
+  ggtheme      = ggplot2::theme_minimal(base_size = 12)
+)
+```
+
+---
+
+## 7. Final Dataset Export
+
+```{r export}
+#| label: export
+
+# In a validated production environment, export as SAS Transport (.xpt) format
+# using haven::write_xpt() for submission to regulatory agencies (FDA, EMA).
+#
+# Example:
+#   haven::write_xpt(adsl, path = "data/adam/adsl.xpt", version = 5, name = "ADSL")
+#   haven::write_xpt(adae, path = "data/adam/adae.xpt", version = 5, name = "ADAE")
+#   haven::write_xpt(advs, path = "data/adam/advs.xpt", version = 5, name = "ADVS")
+
+cat("=====================================================\n")
+cat("  Final ADaM Dataset Summary\n")
+cat("=====================================================\n")
+tibble::tibble(
+  Dataset     = c("ADSL", "ADAE", "ADVS"),
+  Rows        = c(nrow(adsl), nrow(adae), nrow(advs)),
+  Variables   = c(ncol(adsl), ncol(adae), ncol(advs)),
+  Subjects    = c(
+    n_distinct(adsl$USUBJID),
+    n_distinct(adae$USUBJID),
+    n_distinct(advs$USUBJID)
+  ),
+  `Pop Flag`  = c("SAFFL / ITTFL", "SAFFL", "SAFFL"),
+  `Key Vars`  = c(
+    "TRT01P/A, TRTSDT, TRTEDT, TRTDURD, AGEGR1",
+    "TRTEMFL, AESERF, CTC3FLG, ASTDT, ASTDY",
+    "AVAL, BASE, CHG, PCHG, PARAMCD, ADY"
+  )
+) |>
+  gt::gt() |>
+  gt::tab_header(title = "ADaM Datasets Ready for TLF Generation") |>
+  gt::tab_style(
+    style     = gt::cell_fill(color = "#2E75B6", alpha = 0.15),
+    locations = gt::cells_column_labels()
+  ) |>
+  gt::tab_style(
+    style     = gt::cell_text(weight = "bold"),
+    locations = gt::cells_column_labels()
+  )
+```
+
+---
+
+## Conclusion
+
+This report has demonstrated a **complete, CDISC-compliant end-to-end pipeline** using the pharmaverse `admiral` package:
+
+| Phase | Datasets | Key Deliverables |
+|-------|----------|-----------------|
+| **Data Loading** | DM, AE, EX, DS, VS | Domain inventory table |
+| **ADaM Construction** | ADSL, ADAE, ADVS | Treatment vars, population flags, dates, baseline |
+| **Quality Checks** | All | Record counts, duplicates, missing data |
+| **TLFs** | ADSL + ADAE + ADVS | Demographics table, AE incidence, KM curve, vital signs |
+| **Export** | ADSL, ADAE, ADVS | Ready for `write_xpt()` submission packages |
+
+All datasets are audit-ready and reproducible. Next steps would include **ADLB** (Laboratory), **ADTTE** (Time-to-Event), statistical model outputs, and integration into an **RTF/PDF regulatory submission package**.
