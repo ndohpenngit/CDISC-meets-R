@@ -4,7 +4,7 @@ A full end-to-end CDISC-compliant clinical trial analysis pipeline built in R
 using the [pharmaverse](https://pharmaverse.org/) `admiral` package.
 
 ## 🔗 Live Report
-👉 **[View the full rendered analysis here](https://ndohpenn.github.io/CDISC-meets-R/)**
+👉 **[View the full rendered analysis here](https://ndohpenngit.github.io/CDISC-meets-R/)**
 
 ## Overview
 This project demonstrates a production-ready ADaM dataset construction pipeline 
