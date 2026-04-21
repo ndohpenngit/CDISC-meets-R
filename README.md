@@ -55,4 +55,3 @@ clinical-trial-adam/
 
 ## Author
 **Ndoh Penn**  
-[GitHub](https://github.com/ndohpenn)
